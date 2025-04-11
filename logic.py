@@ -1,4 +1,7 @@
-# rag.py
+# logic.py
+import os
+import shutil
+
 from langchain_core.globals import set_verbose, set_debug
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain.schema.output_parser import StrOutputParser
@@ -20,40 +23,38 @@ logger = logging.getLogger(__name__)
 class ChatPDF:
 
     ## Указать используемую версию дистиллята
-    def __init__(self, llm_model: str = "deepseek-r1:8b", embedding_model: str = "mxbai-embed-large"):
+    def __init__(self, llm_model: str = "deepseek-r1:latest", embedding_model: str = "mxbai-embed-large", chunk_size: int = 1024, chunk_overlap: int = 100, temperature: float = 0.7, system_prompt: str = None):
+        # Дефолтный промпт, если не задан
+        default_prompt = (
+            "Ты - полезный помощник, отвечающий на вопросы на основе загруженного документа.\n"
+            "Context:\n{context}\n\nQuestion:\n{question}\n\n"
+            "Ответьте кратко и точно в три предложения или меньше."
+        )
+
         """
         Initialize the ChatPDF instance with an LLM and embedding model.
         """
-        self.model = ChatOllama(model=llm_model)
+        self.model = ChatOllama(model=llm_model, temperature=temperature)
         self.embeddings = OllamaEmbeddings(model=embedding_model)
-        self.text_splitter = RecursiveCharacterTextSplitter(chunk_size=1024, chunk_overlap=100)
-        self.prompt = ChatPromptTemplate.from_template(
-            """
-            Ты - полезный помощник, отвечающий на вопросы на основе загруженного документа.
-            Context:
-            {context}
-
-            Question:
-            {question}
-
-            Ответьте кратко и точно в три предложения или меньше.
-            """
-        )
+        self.text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+        self.prompt_template = system_prompt or default_prompt
+        self.prompt = ChatPromptTemplate.from_template(self.prompt_template)
         self.vector_store = None
         self.retriever = None
 
     def reading(self, pdf_file_path: str):
-        logger.info(f"Начали считывание файла: {pdf_file_path}")
+        logger.info(f"Считывание файла: {pdf_file_path}")
         docs = PyPDFLoader(file_path=pdf_file_path).load()
         chunks = self.text_splitter.split_documents(docs)
         chunks = filter_complex_metadata(chunks)
 
-        self.vector_store = Chroma.from_documents(
-            documents=chunks,
-            embedding=self.embeddings,
-            persist_directory="chroma_db",
-        )
-        logger.info("Считывание документа окончено. Документ добавлен в векторное хранилище.")
+        if self.vector_store is None:
+            self.vector_store = Chroma.from_documents(
+                chunks, self.embeddings, persist_directory="chroma_db"
+            )
+        else:
+            self.vector_store.add_documents(chunks)
+        logger.info("Документ добавлен в хранилище.")
 
     def ask(self, query: str, k: int = 5, score_threshold: float = 0.2):
         if not self.vector_store:
@@ -88,6 +89,14 @@ class ChatPDF:
         return chain.invoke(formatted_input)
 
     def clear(self):
-        logger.info("Очистка хранилища векторов и ретривера.")
-        self.vector_store = None
+        if self.vector_store:
+            self.vector_store.delete_collection()
+            self.vector_store = None
         self.retriever = None
+        if os.path.exists("chroma_db"):
+            shutil.rmtree("chroma_db")
+
+    def update_prompt(self, new_prompt: str):
+        """Обновление промпта без пересоздания всего класса"""
+        self.prompt_template = new_prompt
+        self.prompt = ChatPromptTemplate.from_template(new_prompt)
